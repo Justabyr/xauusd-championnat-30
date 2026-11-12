@@ -47,6 +47,11 @@ if __name__=="__main__":
   try:
    price,stamp=quote()
    if tick(state,price,stamp):
-    save(state);print(stamp,price,"leader",state["bots"][0]["id"],flush=True)
+    save(state)
+    ranked=sorted(state["bots"],key=lambda b:-(b["cash"]+b["oz"]*price))
+    leader=ranked[0]
+    total_trades=sum(b["trades"] for b in state["bots"])
+    active_bots=sum(b["oz"]>0 for b in state["bots"])
+    print(f"{stamp} XAUUSD={price:.2f} leader={leader['id']} equity={leader['cash']+leader['oz']*price:.2f} bots={len(state['bots'])} trades={total_trades} positions_open={active_bots} saved=state.json,leaderboard.csv",flush=True)
   except Exception as e:print("NO TRADE",repr(e),flush=True)
   time.sleep(POLL)
