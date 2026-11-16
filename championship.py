@@ -5,6 +5,10 @@ URL="https://api.gold-api.com/price/XAU"
 DATA=Path(os.getenv("DATA_DIR","/data"))
 POLL=max(30,int(os.getenv("POLL_SECONDS","60")))
 FEE=.0004
+SLIPPAGE=.0002
+MAX_EXPOSURE=.25
+STOP_LOSS=.02
+TAKE_PROFIT=.04
 CONFIGS=([( "ma_cross",a,b) for a,b in [(3,20),(5,25),(8,30),(10,40),(15,60)]]
  +[("rsi",n,k) for n,k in [(7,25),(9,30),(12,35),(14,40),(21,45)]]
  +[("breakout",n,k) for n,k in [(10,0),(15,0),(20,0),(30,0),(45,0)]]
@@ -13,7 +17,7 @@ CONFIGS=([( "ma_cross",a,b) for a,b in [(3,20),(5,25),(8,30),(10,40),(15,60)]]
  +[("macd",a,b) for a,b in [(3,10),(5,15),(8,21),(12,26),(15,35)]])
 assert len(CONFIGS)==30 and len(set(CONFIGS))==30
 def initial():
- return {"version":2,"prices":[],"last":None,"bots":[{"id":i+1,"kind":k,"a":a,"b":b,"cash":10000.0,"oz":0.0,"peak":10000.0,"dd":0.0,"trades":0} for i,(k,a,b) in enumerate(CONFIGS)]}
+ return {"version":3,"prices":[],"last":None,"bots":[{"id":i+1,"kind":k,"a":a,"b":b,"cash":10000.0,"oz":0.0,"peak":10000.0,"dd":0.0,"trades":0,"entry":0.0,"fees_paid":0.0,"realized_pnl":0.0} for i,(k,a,b) in enumerate(CONFIGS)]}
 def quote():
  req=urllib.request.Request(URL,headers={"User-Agent":"XAU-paper-championship/2.0"})
  with urllib.request.urlopen(req,timeout=20) as r:d=json.load(r)
@@ -63,22 +67,50 @@ def tick(s,p,t):
  if t==s["last"]:return False
  if s["prices"] and abs(p/s["prices"][-1]-1)>.1:raise ValueError("Outlier")
  prices=(s["prices"]+[p])[-200:]
+ events=[]
  for b in s["bots"]:
   action=signal(b,prices)
-  if action==1 and b["oz"]==0:
-   b["oz"]=b["cash"]/(p*(1+FEE));b["cash"]=0.;b["trades"]+=1
-  elif action==0 and b["oz"]>0:
-   b["cash"]=b["oz"]*p*(1-FEE);b["oz"]=0.;b["trades"]+=1
+  entry=b.get("entry",0.0)
+  reason=None
+  if b["oz"]>0 and entry>0:
+   if p<=entry*(1-STOP_LOSS):reason="stop_loss"
+   elif p>=entry*(1+TAKE_PROFIT):reason="take_profit"
+  if b["oz"]>0 and (reason or action==0):
+   qty=b["oz"]; execution=p*(1-SLIPPAGE)
+   gross=qty*execution; fee=gross*FEE
+   b["cash"]+=gross-fee;b["oz"]=0.0;b["entry"]=0.0
+   b["fees_paid"]=b.get("fees_paid",0.0)+fee
+   b["realized_pnl"]=b.get("realized_pnl",0.0)+(execution-entry)*qty-fee
+   b["trades"]+=1
+   events.append([t,b["id"],"SELL",reason or "signal",p,execution,qty,fee,b["cash"]])
+  elif action==1 and b["oz"]==0 and b["cash"]>0:
+   budget=b["cash"]*MAX_EXPOSURE
+   execution=p*(1+SLIPPAGE)
+   qty=budget/(execution*(1+FEE))
+   fee=qty*execution*FEE
+   b["cash"]-=qty*execution+fee;b["oz"]=qty;b["entry"]=execution
+   b["fees_paid"]=b.get("fees_paid",0.0)+fee
+   b["realized_pnl"]=b.get("realized_pnl",0.0)-fee
+   b["trades"]+=1
+   events.append([t,b["id"],"BUY","signal",p,execution,qty,fee,b["cash"]])
   equity=b["cash"]+b["oz"]*p
   b["peak"]=max(b["peak"],equity)
   b["dd"]=max(b["dd"],1-equity/b["peak"])
  s["prices"]=prices;s["last"]=t
- return True
+ return events
+def save_events(events):
+ if not events:return
+ path=DATA/"trades.csv"
+ with path.open("a",newline="") as f:
+  w=csv.writer(f)
+  if f.tell()==0:w.writerow(["timestamp","bot","side","reason","quote","execution","quantity","fee","cash_after"])
+  w.writerows(events)
+
 def save(s):
  DATA.mkdir(parents=True,exist_ok=True)
  tmp=DATA/"state.tmp";tmp.write_text(json.dumps(s));tmp.replace(DATA/"state.json")
  p=s["prices"][-1]
- rows=[{"bot":b["id"],"strategy":f'{b["kind"]} {b["a"]}/{b["b"]}',"equity_usd":round(b["cash"]+b["oz"]*p,2),"max_drawdown_pct":round(100*b["dd"],3),"trades":b["trades"]} for b in s["bots"]]
+ rows=[{"bot":b["id"],"strategy":f'{b["kind"]} {b["a"]}/{b["b"]}',"equity_usd":round(b["cash"]+b["oz"]*p,2),"max_drawdown_pct":round(100*b["dd"],3),"trades":b["trades"],"fees_usd":round(b.get("fees_paid",0),2),"realized_pnl_usd":round(b.get("realized_pnl",0),2)} for b in s["bots"]]
  rows.sort(key=lambda x:-x["equity_usd"])
  with (DATA/"leaderboard.tmp").open("w",newline="") as f:
   w=csv.DictWriter(f,fieldnames=rows[0]);w.writeheader();w.writerows(rows)
@@ -87,8 +119,8 @@ def load():
  path=DATA/"state.json"
  if not path.exists():return initial()
  s=json.loads(path.read_text())
- if s.get("version")==2:return s
- archive=DATA/"championship_v1_archive.json"
+ if s.get("version")==3:return s
+ archive=DATA/"championship_previous_archive.json"
  if not archive.exists():shutil.copy2(path,archive)
  return initial()
 if __name__=="__main__":
@@ -97,7 +129,9 @@ if __name__=="__main__":
  while True:
   try:
    price,stamp=quote()
-   if tick(state,price,stamp):
+   if stamp!=state["last"]:
+    events=tick(state,price,stamp)
+    save_events(events)
     save(state)
     ranked=sorted(state["bots"],key=lambda b:-(b["cash"]+b["oz"]*price))
     leader=ranked[0]
